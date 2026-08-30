@@ -92,10 +92,23 @@ def main():
             ]
         )
         client = gspread.authorize(creds)
-        sheet = client.open("Garmin Data").sheet1
-        print("✅ Connected to Google Sheets")
+
+        # Open by spreadsheet ID, not by workbook title. The workbook name and the tab
+        # name are different objects in Google Sheets, and the README/setup expects a
+        # spreadsheet ID secret to be used here.
+        spreadsheet = client.open_by_key(sheet_id)
+
+        # Prefer the worksheet called "Garmin Data" if it exists. If not, fall back to
+        # the first sheet in the workbook.
+        try:
+            sheet = spreadsheet.worksheet("Garmin Data")
+        except gspread.WorksheetNotFound:
+            sheet = spreadsheet.sheet1
+
+        print(f"✅ Connected to Google Sheets: {spreadsheet.title} ({spreadsheet.id})")
     except Exception as e:
         print(f"❌ Failed to connect to Google Sheets: {e}")
+        print("   Check that the GOOGLE_CREDENTIALS secret is valid, the service account has Editor access, and SHEET_ID is the spreadsheet ID from the sheet URL.")
         return
     
     # Get existing dates to avoid duplicates
