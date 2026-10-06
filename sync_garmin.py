@@ -4,15 +4,16 @@ Garmin -> Google Sheets sync for the Sportdata workbook.
 What it writes
   1. "Garmin Data"   one row per run (as before), plus new per-run columns:
                      Aerobic TE, Anaerobic TE, Training Load, Avg Power (W),
-                     VO2max, Start Time, Activity ID.
+                     VO2max, Start Time, Activity ID, running dynamics,
+                     minutes per heart-rate zone and the weather during the run.
                      Columns are matched by header name, so your manual
                      "Run type" column and any column order are left alone.
                      Missing new columns are added to the header automatically,
                      and recent existing rows are back-filled.
   2. "Daily Metrics" one row per day (created on first run): resting HR, HRV,
                      sleep, Body Battery, stress, Training Readiness, VO2max,
-                     training status and load, lactate threshold HR and pace,
-                     and Garmin's race predictions.
+                     training status, load and load focus, lactate threshold HR
+                     and pace, and Garmin's race predictions.
 
 Optional environment variables
   DAILY_DAYS      how many past days to refresh each run (default 3; recent days
@@ -56,7 +57,14 @@ BASE_RUN_HEADERS = [
 NEW_RUN_HEADERS = [
     "Aerobic TE", "Anaerobic TE", "Training Load", "Avg Power (W)",
     "VO2max", "Start Time", "Activity ID",
+    "Ground Contact (ms)", "Vertical Osc (cm)", "Stride (m)", "Vertical Ratio (%)",
 ]
+# These need two extra Garmin requests per run (heart-rate zones and weather).
+DETAIL_RUN_HEADERS = [
+    "Z1 (min)", "Z2 (min)", "Z3 (min)", "Z4 (min)", "Z5 (min)",
+    "Temp (C)", "Feels Like (C)", "Humidity (%)", "Wind (km/h)", "Weather",
+]
+MAX_DETAIL_BACKFILL = 60   # at most this many existing runs get zones/weather per sync
 
 DAILY_HEADERS = [
     "Date",
@@ -67,6 +75,7 @@ DAILY_HEADERS = [
     "VO2max", "Training Status", "Acute Load", "Chronic Load",
     "LT HR (bpm)", "LT Pace (min/km)",
     "Pred 5K (s)", "Pred 10K (s)", "Pred HM (s)", "Pred Marathon (s)",
+    "Load Low Aerobic", "Load High Aerobic", "Load Anaerobic", "Load Focus", "Recovery Time (h)",
 ]
 
 
@@ -174,6 +183,8 @@ def get_laps_json(garmin, activity_id):
                 "avg_hr": lap.get('averageHR'),
                 "max_hr": lap.get('maxHR'),
                 "elevation_gain_m": round(lap.get('elevationGain', 0), 1) if lap.get('elevationGain') else 0,
+                "cadence": round(lap['averageRunCadence']) if lap.get('averageRunCadence') else None,
+                "power": round(lap['averagePower']) if lap.get('averagePower') else None,
             })
         return json.dumps(lap_list)
     except Exception as e:
@@ -206,7 +217,35 @@ def run_values(activity):
         "VO2max": rnd(activity.get('vO2MaxValue'), 1),
         "Start Time": start_local[11:16],
         "Activity ID": str(activity.get('activityId') or ''),
+        "Ground Contact (ms)": rnd(activity.get('avgGroundContactTime'), 0),
+        "Vertical Osc (cm)": rnd(activity.get('avgVerticalOscillation'), 1),
+        "Stride (m)": rnd((activity.get('avgStrideLength') or 0) / 100, 2) if activity.get('avgStrideLength') else "",
+        "Vertical Ratio (%)": rnd(activity.get('avgVerticalRatio'), 1),
     }
+
+
+def detail_values(garmin, activity_id):
+    """Heart-rate zones and weather for one run (two extra Garmin requests)."""
+    out = {name: "" for name in DETAIL_RUN_HEADERS}
+    zones = safe(f"hr zones {activity_id}", garmin.get_activity_hr_in_timezones, activity_id) or []
+    for z in zones if isinstance(zones, list) else []:
+        n = z.get('zoneNumber')
+        if n in (1, 2, 3, 4, 5) and z.get('secsInZone') is not None:
+            out[f"Z{n} (min)"] = round(z['secsInZone'] / 60, 1)
+    w = safe(f"weather {activity_id}", garmin.get_activity_weather, activity_id) or {}
+    if isinstance(w, dict):
+        f_to_c = lambda f: round((f - 32) * 5 / 9, 1)          # Garmin reports Fahrenheit
+        if w.get('temp') is not None:
+            out["Temp (C)"] = f_to_c(w['temp'])
+        if w.get('apparentTemp') is not None:
+            out["Feels Like (C)"] = f_to_c(w['apparentTemp'])
+        if w.get('relativeHumidity') is not None:
+            out["Humidity (%)"] = w['relativeHumidity']
+        if w.get('windSpeed') is not None:
+            out["Wind (km/h)"] = round(w['windSpeed'] * 1.609, 0)   # Garmin reports mph
+        out["Weather"] = dig(w, 'weatherTypeDTO', 'desc', default="") or ""
+    time.sleep(0.3)
+    return out
 
 
 def ensure_headers(sheet, wanted, base=None):
@@ -249,7 +288,8 @@ def sync_runs(garmin, spreadsheet):
     except gspread.WorksheetNotFound:
         sheet = spreadsheet.sheet1
 
-    header = ensure_headers(sheet, BASE_RUN_HEADERS[:12] + NEW_RUN_HEADERS, base=BASE_RUN_HEADERS + NEW_RUN_HEADERS)
+    header = ensure_headers(sheet, BASE_RUN_HEADERS[:12] + NEW_RUN_HEADERS + DETAIL_RUN_HEADERS,
+                            base=BASE_RUN_HEADERS + NEW_RUN_HEADERS + DETAIL_RUN_HEADERS)
     col = {name: i for i, name in enumerate(header)}  # 0-based
 
     rows = sheet.get_all_values()[1:]
@@ -262,21 +302,27 @@ def sync_runs(garmin, spreadsheet):
     print(f"Found {len(rows)} existing entries")
     matched_rows = set()
 
-    # ---- back-fill the new columns on existing rows (matched by date + distance)
-    updates = []
+    # ---- back-fill the new columns on existing rows (matched by Activity ID, else date + distance)
+    by_id = {str(a.get('activityId')): a for a in running if a.get('activityId')}
+    updates, detail_budget = [], MAX_DETAIL_BACKFILL
     for row_number, r in enumerate(rows, start=2):
-        if cell(r, "Activity ID"):
-            continue
-        r_date, r_km = cell(r, "Date"), to_number(cell(r, "Distance (km)"))
-        match = next((a for a in running
-                      if (a.get('startTimeLocal', '') or '')[:10] == r_date
-                      and r_km is not None
-                      and abs(round((a.get('distance', 0) or 0) / 1000, 2) - r_km) <= 0.03), None)
+        r_id = cell(r, "Activity ID")
+        if r_id:
+            match = by_id.get(r_id)
+        else:
+            r_date, r_km = cell(r, "Date"), to_number(cell(r, "Distance (km)"))
+            match = next((a for a in running
+                          if (a.get('startTimeLocal', '') or '')[:10] == r_date
+                          and r_km is not None
+                          and abs(round((a.get('distance', 0) or 0) / 1000, 2) - r_km) <= 0.03), None)
         if not match:
             continue
         values = run_values(match)
-        for name in NEW_RUN_HEADERS:
-            if not cell(r, name) and values[name] != "":
+        if detail_budget > 0 and not any(cell(r, name) for name in DETAIL_RUN_HEADERS):
+            values.update(detail_values(garmin, match.get('activityId')))
+            detail_budget -= 1
+        for name in NEW_RUN_HEADERS + DETAIL_RUN_HEADERS:
+            if not cell(r, name) and values.get(name, "") != "":
                 updates.append({"range": rowcol_to_a1(row_number, col[name] + 1), "values": [[values[name]]]})
         existing_ids.add(values["Activity ID"])
         matched_rows.add(row_number)
@@ -301,6 +347,8 @@ def sync_runs(garmin, spreadsheet):
                 continue
             activity_id = activity.get('activityId')
             values["Lap Details"] = get_laps_json(garmin, activity_id) if activity_id else "[]"
+            if activity_id:
+                values.update(detail_values(garmin, activity_id))
             row = [values.get(name, "") for name in header]  # "Run type" and unknown columns stay empty
             new_rows.append(row)
             n_laps = len(json.loads(values["Lap Details"]))
@@ -343,20 +391,30 @@ def race_predictions(garmin):
 
 
 def training_status(garmin, day):
-    """Returns (status phrase, acute load, chronic load, vo2max) for a day."""
+    """Training status, acute/chronic load, VO2max and load focus for a day."""
     data = safe(f"training status {day}", garmin.get_training_status, day) or {}
-    vo2 = dig(data, 'mostRecentVO2Max', 'generic', 'vo2MaxPreciseValue') or dig(data, 'mostRecentVO2Max', 'generic', 'vo2MaxValue')
-    status, acute, chronic = "", "", ""
+    out = {"status": "", "acute": "", "chronic": "", "low": "", "high": "", "anaerobic": "", "focus": "",
+           "vo2": dig(data, 'mostRecentVO2Max', 'generic', 'vo2MaxPreciseValue') or dig(data, 'mostRecentVO2Max', 'generic', 'vo2MaxValue')}
     per_device = dig(data, 'mostRecentTrainingStatus', 'latestTrainingStatusData', default={}) or {}
     for dev in per_device.values():
         if not isinstance(dev, dict):
             continue
-        status = dev.get('trainingStatusFeedbackPhrase') or status
-        acute = dig(dev, 'acuteTrainingLoadDTO', 'dailyTrainingLoadAcute', default=acute)
-        chronic = dig(dev, 'acuteTrainingLoadDTO', 'dailyTrainingLoadChronic', default=chronic)
+        out["status"] = dev.get('trainingStatusFeedbackPhrase') or out["status"]
+        out["acute"] = dig(dev, 'acuteTrainingLoadDTO', 'dailyTrainingLoadAcute', default=out["acute"])
+        out["chronic"] = dig(dev, 'acuteTrainingLoadDTO', 'dailyTrainingLoadChronic', default=out["chronic"])
         if dev.get('primaryTrainingDevice'):
             break
-    return status, acute, chronic, vo2
+    balance = dig(data, 'mostRecentTrainingLoadBalance', 'metricsTrainingLoadBalanceDTOMap', default={}) or {}
+    for dev in balance.values():
+        if not isinstance(dev, dict):
+            continue
+        out["low"] = dev.get('monthlyLoadAerobicLow', out["low"])
+        out["high"] = dev.get('monthlyLoadAerobicHigh', out["high"])
+        out["anaerobic"] = dev.get('monthlyLoadAnaerobic', out["anaerobic"])
+        out["focus"] = dev.get('trainingBalanceFeedbackPhrase') or out["focus"]
+        if dev.get('primaryTrainingDevice'):
+            break
+    return out
 
 
 def daily_row(garmin, day, lt, preds, is_today):
@@ -365,7 +423,8 @@ def daily_row(garmin, day, lt, preds, is_today):
     sleep = safe(f"sleep {day}", garmin.get_sleep_data, day) or {}
     hrv = safe(f"hrv {day}", garmin.get_hrv_data, day) or {}
     readiness = safe(f"readiness {day}", garmin.get_training_readiness, day) or []
-    status, acute, chronic, vo2 = training_status(garmin, day)
+    ts = training_status(garmin, day)
+    status, acute, chronic, vo2 = ts["status"], ts["acute"], ts["chronic"], ts["vo2"]
     if not vo2:
         mm = safe(f"max metrics {day}", garmin.get_max_metrics, day)
         vo2 = dig(mm, 0, 'generic', 'vo2MaxPreciseValue') or dig(mm, 'generic', 'vo2MaxPreciseValue')
@@ -399,6 +458,12 @@ def daily_row(garmin, day, lt, preds, is_today):
         "Pred 10K (s)": preds[1] if is_today else "",
         "Pred HM (s)": preds[2] if is_today else "",
         "Pred Marathon (s)": preds[3] if is_today else "",
+        "Load Low Aerobic": rnd(ts["low"], 0),
+        "Load High Aerobic": rnd(ts["high"], 0),
+        "Load Anaerobic": rnd(ts["anaerobic"], 0),
+        "Load Focus": ts["focus"],
+        # Garmin gives recovery time in minutes, on watches that report it.
+        "Recovery Time (h)": round(ready['recoveryTime'] / 60, 1) if ready and ready.get('recoveryTime') else "",
     }
     return row
 
