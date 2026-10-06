@@ -1,9 +1,34 @@
+"""
+Garmin -> Google Sheets sync for the Sportdata workbook.
+
+What it writes
+  1. "Garmin Data"   one row per run (as before), plus new per-run columns:
+                     Aerobic TE, Anaerobic TE, Training Load, Avg Power (W),
+                     VO2max, Start Time, Activity ID.
+                     Columns are matched by header name, so your manual
+                     "Run type" column and any column order are left alone.
+                     Missing new columns are added to the header automatically,
+                     and recent existing rows are back-filled.
+  2. "Daily Metrics" one row per day (created on first run): resting HR, HRV,
+                     sleep, Body Battery, stress, Training Readiness, VO2max,
+                     training status and load, lactate threshold HR and pace,
+                     and Garmin's race predictions.
+
+Optional environment variables
+  DAILY_DAYS      how many past days to refresh each run (default 3; recent days
+                  are refreshed because sleep/HRV arrive after the night ends)
+  DAILY_BACKFILL  how many days to fill the first time the tab is empty (default 30)
+"""
+
 import os
 import json
+import time
+from datetime import date, datetime, timedelta
+
 from garminconnect import Garmin
 from google.oauth2.service_account import Credentials
 import gspread
-from datetime import datetime, timedelta
+from gspread.utils import rowcol_to_a1
 
 # Load environment variables from .env file if it exists (for local testing)
 if os.path.exists('.env'):
@@ -12,8 +37,42 @@ if os.path.exists('.env'):
         load_dotenv()
     except ImportError:
         print("Warning: python-dotenv not installed. Install with: pip install python-dotenv")
-        pass
 
+
+# --------------------------------------------------------------------------
+# Sheet layout
+# --------------------------------------------------------------------------
+
+RUN_SHEET = "Garmin Data"
+DAILY_SHEET = "Daily Metrics"
+
+# Original columns, in the original order (used only if the sheet has no header yet).
+BASE_RUN_HEADERS = [
+    "Date", "Activity Name", "Distance (km)", "Duration (min)", "Avg Pace (min/km)",
+    "Avg HR", "Max HR", "Calories", "Avg Cadence", "Elevation Gain (m)",
+    "Activity Type", "Lap Details", "Run type",
+]
+# New per-run columns. Added to the right of whatever is already there.
+NEW_RUN_HEADERS = [
+    "Aerobic TE", "Anaerobic TE", "Training Load", "Avg Power (W)",
+    "VO2max", "Start Time", "Activity ID",
+]
+
+DAILY_HEADERS = [
+    "Date",
+    "Resting HR", "HRV Last Night (ms)", "HRV Weekly Avg (ms)", "HRV Status",
+    "Sleep Score", "Sleep (h)",
+    "Body Battery Wake", "Body Battery High", "Body Battery Low", "Avg Stress",
+    "Training Readiness", "Readiness Level",
+    "VO2max", "Training Status", "Acute Load", "Chronic Load",
+    "LT HR (bpm)", "LT Pace (min/km)",
+    "Pred 5K (s)", "Pred 10K (s)", "Pred HM (s)", "Pred Marathon (s)",
+]
+
+
+# --------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------
 
 def format_duration(seconds):
     """Convert seconds to minutes (rounded to 2 decimals)"""
@@ -42,6 +101,55 @@ def format_pace_str(distance_meters, duration_seconds):
         s = 0
     return f"{m}:{s:02d}"
 
+
+def dig(obj, *path, default=None):
+    """Safely walk nested dicts/lists: dig(d, 'a', 0, 'b'). Returns default on any miss."""
+    cur = obj
+    for key in path:
+        try:
+            if isinstance(cur, dict):
+                cur = cur.get(key)
+            elif isinstance(cur, (list, tuple)) and isinstance(key, int):
+                cur = cur[key]
+            else:
+                return default
+        except (IndexError, KeyError, TypeError):
+            return default
+        if cur is None:
+            return default
+    return cur
+
+
+def rnd(value, digits=1):
+    """Round numbers, pass through None as an empty cell."""
+    if value is None or value == "":
+        return ""
+    try:
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return ""
+
+
+def safe(label, fn, *args, **kwargs):
+    """Call a Garmin endpoint; one failing metric never blocks the rest."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:  # noqa: BLE001 - Garmin raises many different errors
+        print(f"  ⚠️ {label}: {e}")
+        return None
+
+
+def to_number(text):
+    """Parse a sheet cell that may use a decimal comma (Dutch locale)."""
+    try:
+        return float(str(text).replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+
+
+# --------------------------------------------------------------------------
+# Runs
+# --------------------------------------------------------------------------
 
 def get_laps_json(garmin, activity_id):
     """
@@ -73,14 +181,287 @@ def get_laps_json(garmin, activity_id):
         return "[]"
 
 
+def run_values(activity):
+    """All per-run values that come straight from the activity list (no extra API call)."""
+    distance_m = activity.get('distance', 0) or 0
+    duration_s = activity.get('duration', 0) or 0
+    start_local = activity.get('startTimeLocal', '') or ''
+    return {
+        "Date": start_local[:10],
+        "Activity Name": activity.get('activityName', 'Run'),
+        "Distance (km)": round(distance_m / 1000, 2) if distance_m else 0,
+        "Duration (min)": format_duration(duration_s),
+        "Avg Pace (min/km)": format_pace(distance_m, duration_s),
+        "Avg HR": activity.get('averageHR', 0) or 0,
+        "Max HR": activity.get('maxHR', 0) or 0,
+        "Calories": activity.get('calories', 0) or 0,
+        "Avg Cadence": activity.get('averageRunningCadenceInStepsPerMinute', 0) or 0,
+        "Elevation Gain (m)": round(activity.get('elevationGain', 0), 1) if activity.get('elevationGain') else 0,
+        "Activity Type": dig(activity, 'activityType', 'typeKey', default='running'),
+        # New columns
+        "Aerobic TE": rnd(activity.get('aerobicTrainingEffect'), 1),
+        "Anaerobic TE": rnd(activity.get('anaerobicTrainingEffect'), 1),
+        "Training Load": rnd(activity.get('activityTrainingLoad'), 0),
+        "Avg Power (W)": rnd(activity.get('avgPower'), 0),
+        "VO2max": rnd(activity.get('vO2MaxValue'), 1),
+        "Start Time": start_local[11:16],
+        "Activity ID": str(activity.get('activityId') or ''),
+    }
+
+
+def ensure_headers(sheet, wanted, base=None):
+    """Return the header row, adding any missing column names to the right."""
+    header = sheet.row_values(1)
+    if not header:
+        header = list(base or wanted)
+        sheet.update(range_name="A1", values=[header])
+    missing = [h for h in wanted if h not in header]
+    if missing:
+        first_col = len(header) + 1
+        needed_cols = len(header) + len(missing)
+        if sheet.col_count < needed_cols:
+            sheet.add_cols(needed_cols - sheet.col_count)
+        sheet.update(range_name=rowcol_to_a1(1, first_col), values=[missing])
+        header = header + missing
+        print(f"  Added columns to '{sheet.title}': {', '.join(missing)}")
+    return header
+
+
+def sync_runs(garmin, spreadsheet):
+    print("\nFetching recent activities...")
+    try:
+        activities = garmin.get_activities(0, 50)  # Get last 50 activities
+        print(f"Found {len(activities)} total activities")
+    except Exception as e:
+        print(f"❌ Failed to fetch activities: {e}")
+        return
+
+    running = [
+        a for a in activities
+        if dig(a, 'activityType', 'typeKey', default='').lower() in ['running', 'treadmill_running', 'trail_running']
+    ]
+    print(f"Found {len(running)} running activities")
+    if not running:
+        return
+
+    try:
+        sheet = spreadsheet.worksheet(RUN_SHEET)
+    except gspread.WorksheetNotFound:
+        sheet = spreadsheet.sheet1
+
+    header = ensure_headers(sheet, BASE_RUN_HEADERS[:12] + NEW_RUN_HEADERS, base=BASE_RUN_HEADERS + NEW_RUN_HEADERS)
+    col = {name: i for i, name in enumerate(header)}  # 0-based
+
+    rows = sheet.get_all_values()[1:]
+
+    def cell(row, name):
+        i = col.get(name)
+        return row[i] if i is not None and i < len(row) else ""
+
+    existing_ids = {cell(r, "Activity ID") for r in rows if cell(r, "Activity ID")}
+    print(f"Found {len(rows)} existing entries")
+    matched_rows = set()
+
+    # ---- back-fill the new columns on existing rows (matched by date + distance)
+    updates = []
+    for row_number, r in enumerate(rows, start=2):
+        if cell(r, "Activity ID"):
+            continue
+        r_date, r_km = cell(r, "Date"), to_number(cell(r, "Distance (km)"))
+        match = next((a for a in running
+                      if (a.get('startTimeLocal', '') or '')[:10] == r_date
+                      and r_km is not None
+                      and abs(round((a.get('distance', 0) or 0) / 1000, 2) - r_km) <= 0.03), None)
+        if not match:
+            continue
+        values = run_values(match)
+        for name in NEW_RUN_HEADERS:
+            if not cell(r, name) and values[name] != "":
+                updates.append({"range": rowcol_to_a1(row_number, col[name] + 1), "values": [[values[name]]]})
+        existing_ids.add(values["Activity ID"])
+        matched_rows.add(row_number)
+    if updates:
+        sheet.batch_update(updates, value_input_option="RAW")
+        print(f"  Back-filled {len(updates)} cells on existing rows")
+
+    # Rows from the old script that could not be matched have no Activity ID: fall back to the date for those.
+    dates_without_id = {cell(r, "Date") for n, r in enumerate(rows, start=2)
+                        if cell(r, "Date") and not cell(r, "Activity ID") and n not in matched_rows}
+
+    # ---- append new runs (oldest first, so the sheet stays in date order)
+    new_rows = []
+    for activity in sorted(running, key=lambda a: a.get('startTimeLocal', '') or ''):
+        try:
+            values = run_values(activity)
+            if values["Activity ID"] in existing_ids:
+                continue
+            if values["Date"] in dates_without_id:
+                # an old-style row for this date that could not be matched by distance
+                print(f"Skipping {values['Date']} - already exists")
+                continue
+            activity_id = activity.get('activityId')
+            values["Lap Details"] = get_laps_json(garmin, activity_id) if activity_id else "[]"
+            row = [values.get(name, "") for name in header]  # "Run type" and unknown columns stay empty
+            new_rows.append(row)
+            n_laps = len(json.loads(values["Lap Details"]))
+            print(f"✅ New: {values['Date']} - {values['Activity Name']} ({values['Distance (km)']} km, {n_laps} laps)")
+        except Exception as e:
+            print(f"❌ Error processing activity: {e}")
+
+    if new_rows:
+        sheet.append_rows(new_rows, value_input_option="RAW", table_range="A1")
+        print(f"\n🎉 Successfully added {len(new_rows)} new running activities!")
+    else:
+        print("\n✓ No new activities to add")
+
+
+# --------------------------------------------------------------------------
+# Daily metrics
+# --------------------------------------------------------------------------
+
+def lactate_threshold(garmin):
+    """Latest lactate threshold as (heart rate, pace in min/km)."""
+    data = safe("lactate threshold", garmin.get_lactate_threshold, latest=True)
+    hr = dig(data, 'speed_and_heart_rate', 'heartRate')
+    speed = dig(data, 'speed_and_heart_rate', 'speed')
+    pace = ""
+    if speed:
+        speed = float(speed)
+        if speed < 1:          # Garmin stores this as metres per second divided by 10
+            speed *= 10
+        if speed > 0:
+            pace = round(1000 / speed / 60, 2)
+    return (hr or ""), pace
+
+
+def race_predictions(garmin):
+    data = safe("race predictions", garmin.get_race_predictions)
+    if isinstance(data, list):
+        data = data[-1] if data else {}
+    data = data or {}
+    return [data.get(k, "") or "" for k in ("time5K", "time10K", "timeHalfMarathon", "timeMarathon")]
+
+
+def training_status(garmin, day):
+    """Returns (status phrase, acute load, chronic load, vo2max) for a day."""
+    data = safe(f"training status {day}", garmin.get_training_status, day) or {}
+    vo2 = dig(data, 'mostRecentVO2Max', 'generic', 'vo2MaxPreciseValue') or dig(data, 'mostRecentVO2Max', 'generic', 'vo2MaxValue')
+    status, acute, chronic = "", "", ""
+    per_device = dig(data, 'mostRecentTrainingStatus', 'latestTrainingStatusData', default={}) or {}
+    for dev in per_device.values():
+        if not isinstance(dev, dict):
+            continue
+        status = dev.get('trainingStatusFeedbackPhrase') or status
+        acute = dig(dev, 'acuteTrainingLoadDTO', 'dailyTrainingLoadAcute', default=acute)
+        chronic = dig(dev, 'acuteTrainingLoadDTO', 'dailyTrainingLoadChronic', default=chronic)
+        if dev.get('primaryTrainingDevice'):
+            break
+    return status, acute, chronic, vo2
+
+
+def daily_row(garmin, day, lt, preds, is_today):
+    """Collect one day's metrics. `day` is 'YYYY-MM-DD'."""
+    stats = safe(f"stats {day}", garmin.get_stats, day) or {}
+    sleep = safe(f"sleep {day}", garmin.get_sleep_data, day) or {}
+    hrv = safe(f"hrv {day}", garmin.get_hrv_data, day) or {}
+    readiness = safe(f"readiness {day}", garmin.get_training_readiness, day) or []
+    status, acute, chronic, vo2 = training_status(garmin, day)
+    if not vo2:
+        mm = safe(f"max metrics {day}", garmin.get_max_metrics, day)
+        vo2 = dig(mm, 0, 'generic', 'vo2MaxPreciseValue') or dig(mm, 'generic', 'vo2MaxPreciseValue')
+
+    sleep_seconds = dig(sleep, 'dailySleepDTO', 'sleepTimeSeconds')
+    # Readiness is a list with the newest reading first; take the first one that has a score.
+    ready = next((r for r in readiness if isinstance(r, dict) and r.get('score') is not None), {}) if isinstance(readiness, list) else (readiness or {})
+
+    row = {
+        "Date": day,
+        "Resting HR": stats.get('restingHeartRate') or dig(sleep, 'restingHeartRate') or "",
+        "HRV Last Night (ms)": dig(hrv, 'hrvSummary', 'lastNightAvg') or dig(sleep, 'avgOvernightHrv') or "",
+        "HRV Weekly Avg (ms)": dig(hrv, 'hrvSummary', 'weeklyAvg') or "",
+        "HRV Status": dig(hrv, 'hrvSummary', 'status') or "",
+        "Sleep Score": dig(sleep, 'dailySleepDTO', 'sleepScores', 'overall', 'value') or "",
+        "Sleep (h)": round(sleep_seconds / 3600, 2) if sleep_seconds else "",
+        "Body Battery Wake": stats.get('bodyBatteryAtWakeTime') or "",
+        "Body Battery High": stats.get('bodyBatteryHighestValue') or "",
+        "Body Battery Low": stats.get('bodyBatteryLowestValue') or "",
+        "Avg Stress": stats.get('averageStressLevel') if (stats.get('averageStressLevel') or 0) > 0 else "",
+        "Training Readiness": ready.get('score', "") if ready else "",
+        "Readiness Level": ready.get('level', "") if ready else "",
+        "VO2max": rnd(vo2, 1),
+        "Training Status": status,
+        "Acute Load": rnd(acute, 0),
+        "Chronic Load": rnd(chronic, 0),
+        # Threshold and predictions are "latest" values, so they are only stamped on today's row.
+        "LT HR (bpm)": lt[0] if is_today else "",
+        "LT Pace (min/km)": lt[1] if is_today else "",
+        "Pred 5K (s)": preds[0] if is_today else "",
+        "Pred 10K (s)": preds[1] if is_today else "",
+        "Pred HM (s)": preds[2] if is_today else "",
+        "Pred Marathon (s)": preds[3] if is_today else "",
+    }
+    return row
+
+
+def sync_daily(garmin, spreadsheet):
+    print("\nSyncing daily metrics...")
+    try:
+        sheet = spreadsheet.worksheet(DAILY_SHEET)
+    except gspread.WorksheetNotFound:
+        sheet = spreadsheet.add_worksheet(title=DAILY_SHEET, rows=400, cols=len(DAILY_HEADERS))
+        print(f"  Created tab '{DAILY_SHEET}'")
+
+    header = ensure_headers(sheet, DAILY_HEADERS)
+    col = {name: i for i, name in enumerate(header)}
+    rows = sheet.get_all_values()[1:]
+    row_of = {r[col["Date"]]: n for n, r in enumerate(rows, start=2) if r and len(r) > col["Date"] and r[col["Date"]]}
+
+    days_back = int(os.environ.get("DAILY_DAYS", "3"))
+    if not row_of:
+        days_back = int(os.environ.get("DAILY_BACKFILL", "30"))
+        print(f"  Empty tab: back-filling {days_back} days")
+
+    today = date.today()
+    lt = lactate_threshold(garmin)
+    preds = race_predictions(garmin)
+
+    updates, appends = [], []
+    for offset in range(days_back - 1, -1, -1):          # oldest first
+        day = (today - timedelta(days=offset)).isoformat()
+        values = daily_row(garmin, day, lt, preds, is_today=(offset == 0))
+        if day in row_of:
+            existing = rows[row_of[day] - 2]
+            line = []
+            for i, name in enumerate(header):
+                new = values.get(name, "")
+                old = existing[i] if i < len(existing) else ""
+                line.append(new if new != "" else old)       # never blank out a value we already had
+            updates.append({"range": rowcol_to_a1(row_of[day], 1), "values": [line]})
+        else:
+            appends.append([values.get(name, "") for name in header])
+        filled = sum(1 for k, v in values.items() if k != "Date" and v != "")
+        print(f"  {day}: {filled} metrics")
+        time.sleep(0.5)                                      # be gentle with Garmin
+
+    if updates:
+        sheet.batch_update(updates, value_input_option="RAW")
+    if appends:
+        sheet.append_rows(appends, value_input_option="RAW", table_range="A1")
+    print(f"✅ Daily metrics: {len(appends)} new day(s), {len(updates)} refreshed")
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
 def main():
-    print("Starting Garmin running activities sync...")
+    print("Starting Garmin sync...")
 
     # Get credentials from environment variables
     garmin_email = os.environ.get('GARMIN_EMAIL')
     garmin_password = os.environ.get('GARMIN_PASSWORD')
     google_creds_json = os.environ.get('GOOGLE_CREDENTIALS')
-    sheet_id = os.environ.get('SHEET_ID')  # Add sheet ID from environment
+    sheet_id = os.environ.get('SHEET_ID')
 
     # For local testing: try to load from credentials.json file
     if not google_creds_json and os.path.exists('credentials.json'):
@@ -106,26 +487,6 @@ def main():
         print(f"❌ Failed to connect to Garmin: {e}")
         return
 
-    # Get recent activities
-    print("Fetching recent activities...")
-    try:
-        activities = garmin.get_activities(0, 50)  # Get last 50 activities
-        print(f"Found {len(activities)} total activities")
-    except Exception as e:
-        print(f"❌ Failed to fetch activities: {e}")
-        return
-
-    # Filter for running activities only
-    running_activities = [
-        activity for activity in activities
-        if activity.get('activityType', {}).get('typeKey', '').lower() in ['running', 'treadmill_running', 'trail_running']
-    ]
-    print(f"Found {len(running_activities)} running activities")
-
-    if not running_activities:
-        print("No running activities found in recent data")
-        return
-
     # Connect to Google Sheets
     print("Connecting to Google Sheets...")
     try:
@@ -138,91 +499,24 @@ def main():
             ]
         )
         client = gspread.authorize(creds)
-
-        # Open by spreadsheet ID, not by workbook title.
-        spreadsheet = client.open_by_key(sheet_id)
-
-        # Prefer the worksheet called "Garmin Data" if it exists.
-        try:
-            sheet = spreadsheet.worksheet("Garmin Data")
-        except gspread.WorksheetNotFound:
-            sheet = spreadsheet.sheet1
-
+        spreadsheet = client.open_by_key(sheet_id)   # open by spreadsheet ID, not by title
         print(f"✅ Connected to Google Sheets: {spreadsheet.title} ({spreadsheet.id})")
     except Exception as e:
         print(f"❌ Failed to connect to Google Sheets: {e}")
         print("  Check that the GOOGLE_CREDENTIALS secret is valid, the service account has Editor access, and SHEET_ID is the spreadsheet ID from the sheet URL.")
         return
 
-    # Get existing dates to avoid duplicates
+    # The two parts are independent: a failure in one never blocks the other.
     try:
-        existing_data = sheet.get_all_values()
-        existing_dates = set()
-        if len(existing_data) > 1:
-            for row in existing_data[1:]:
-                if row and row[0]:
-                    existing_dates.add(row[0])
-        print(f"Found {len(existing_dates)} existing entries")
+        sync_runs(garmin, spreadsheet)
     except Exception as e:
-        print(f"Warning: Could not check existing data: {e}")
-        existing_dates = set()
+        print(f"❌ Run sync failed: {e}")
+    try:
+        sync_daily(garmin, spreadsheet)
+    except Exception as e:
+        print(f"❌ Daily metrics sync failed: {e}")
 
-    # Process each running activity
-    new_entries = 0
-    for activity in running_activities:
-        try:
-            activity_date = activity.get('startTimeLocal', '')[:10]
-
-            if activity_date in existing_dates:
-                print(f"Skipping {activity_date} - already exists")
-                continue
-
-            activity_id = activity.get('activityId')
-            activity_name = activity.get('activityName', 'Run')
-            distance_meters = activity.get('distance', 0)
-            distance_km = round(distance_meters / 1000, 2) if distance_meters else 0
-            duration_seconds = activity.get('duration', 0)
-            duration_min = format_duration(duration_seconds)
-            avg_pace = format_pace(distance_meters, duration_seconds)
-            avg_hr = activity.get('averageHR', 0) or 0
-            max_hr = activity.get('maxHR', 0) or 0
-            calories = activity.get('calories', 0) or 0
-            avg_cadence = activity.get('averageRunningCadenceInStepsPerMinute', 0) or 0
-            elevation_gain = round(activity.get('elevationGain', 0), 1) if activity.get('elevationGain') else 0
-            activity_type = activity.get('activityType', {}).get('typeKey', 'running')
-
-            # NEW: fetch per-lap breakdown so hill reps / tempo segments / recovery
-            # jogs show up distinctly instead of being averaged into one row.
-            laps_json = get_laps_json(garmin, activity_id) if activity_id else "[]"
-
-            row = [
-                activity_date,
-                activity_name,
-                distance_km,
-                duration_min,
-                avg_pace,
-                avg_hr,
-                max_hr,
-                calories,
-                avg_cadence,
-                elevation_gain,
-                activity_type,
-                laps_json  # NEW: column 12
-            ]
-
-            sheet.append_row(row)
-            n_laps = len(json.loads(laps_json))
-            print(f"✅ Added: {activity_date} - {activity_name} ({distance_km} km, {n_laps} laps)")
-            new_entries += 1
-
-        except Exception as e:
-            print(f"❌ Error processing activity: {e}")
-            continue
-
-    if new_entries > 0:
-        print(f"\n🎉 Successfully added {new_entries} new running activities!")
-    else:
-        print("\n✓ No new activities to add")
+    print(f"\nDone at {datetime.now().isoformat(timespec='seconds')}")
 
 
 if __name__ == "__main__":
