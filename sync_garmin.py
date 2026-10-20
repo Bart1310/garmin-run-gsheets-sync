@@ -10,6 +10,9 @@ What it writes
                      "Run type" column and any column order are left alone.
                      Missing new columns are added to the header automatically,
                      and recent existing rows are back-filled.
+                     Avg Pace uses Garmin's moving time (stops at traffic lights
+                     are left out, walking still counts); treadmill runs keep the
+                     timer time. Duration (min) stays the timer time.
   2. "Daily Metrics" one row per day (created on first run): resting HR, HRV,
                      sleep, Body Battery, stress, Training Readiness, VO2max,
                      training status, load and load focus, lactate threshold HR
@@ -58,13 +61,15 @@ NEW_RUN_HEADERS = [
     "Aerobic TE", "Anaerobic TE", "Training Load", "Avg Power (W)",
     "VO2max", "Start Time", "Activity ID",
     "Ground Contact (ms)", "Vertical Osc (cm)", "Stride (m)", "Vertical Ratio (%)",
+    "Moving Time (min)",
 ]
 # These need two extra Garmin requests per run (heart-rate zones and weather).
 DETAIL_RUN_HEADERS = [
     "Z1 (min)", "Z2 (min)", "Z3 (min)", "Z4 (min)", "Z5 (min)",
     "Temp (C)", "Feels Like (C)", "Humidity (%)", "Wind (km/h)", "Weather",
 ]
-MAX_DETAIL_BACKFILL = 60   # at most this many existing runs get zones/weather per sync
+MAX_DETAIL_BACKFILL = 60
+DEEP_FETCH = 400           # how far back to look while older runs still lack Moving Time   # at most this many existing runs get zones/weather per sync
 
 DAILY_HEADERS = [
     "Date",
@@ -192,17 +197,33 @@ def get_laps_json(garmin, activity_id):
         return "[]"
 
 
+def pace_seconds_basis(activity):
+    """
+    Seconds used for the average pace: Garmin's moving time (standing still at a
+    traffic light is left out; walking still counts as moving), falling back to
+    the timer time. Treadmill runs keep the timer time, because their moving time
+    comes from the wrist/footpod speed and is unreliable after a distance edit.
+    """
+    duration_s = activity.get('duration', 0) or 0
+    moving_s = activity.get('movingDuration') or 0
+    is_treadmill = dig(activity, 'activityType', 'typeKey', default='') == 'treadmill_running'
+    if is_treadmill or not moving_s or moving_s > duration_s or moving_s < 0.5 * duration_s:
+        return duration_s
+    return moving_s
+
+
 def run_values(activity):
     """All per-run values that come straight from the activity list (no extra API call)."""
     distance_m = activity.get('distance', 0) or 0
     duration_s = activity.get('duration', 0) or 0
+    moving_s = activity.get('movingDuration') or 0
     start_local = activity.get('startTimeLocal', '') or ''
     return {
         "Date": start_local[:10],
         "Activity Name": activity.get('activityName', 'Run'),
         "Distance (km)": round(distance_m / 1000, 2) if distance_m else 0,
         "Duration (min)": format_duration(duration_s),
-        "Avg Pace (min/km)": format_pace(distance_m, duration_s),
+        "Avg Pace (min/km)": format_pace(distance_m, pace_seconds_basis(activity)),
         "Avg HR": activity.get('averageHR', 0) or 0,
         "Max HR": activity.get('maxHR', 0) or 0,
         "Calories": activity.get('calories', 0) or 0,
@@ -221,6 +242,7 @@ def run_values(activity):
         "Vertical Osc (cm)": rnd(activity.get('avgVerticalOscillation'), 1),
         "Stride (m)": rnd((activity.get('avgStrideLength') or 0) / 100, 2) if activity.get('avgStrideLength') else "",
         "Vertical Ratio (%)": rnd(activity.get('avgVerticalRatio'), 1),
+        "Moving Time (min)": format_duration(moving_s) if moving_s else "",
     }
 
 
@@ -269,11 +291,33 @@ def ensure_headers(sheet, wanted, base=None):
 def sync_runs(garmin, spreadsheet):
     print("\nFetching recent activities...")
     try:
-        activities = garmin.get_activities(0, 50)  # Get last 50 activities
-        print(f"Found {len(activities)} total activities")
+        sheet = spreadsheet.worksheet(RUN_SHEET)
+    except gspread.WorksheetNotFound:
+        sheet = spreadsheet.sheet1
+
+    # Normally the last 50 activities (all sports) are enough. While some run rows still
+    # have no "Moving Time (min)", look further back (up to DEEP_FETCH) so they get filled too.
+    first = sheet.row_values(1)
+    deep = False
+    if "Moving Time (min)" not in first:
+        deep = True
+    else:
+        mi = first.index("Moving Time (min)")
+        di = first.index("Date") if "Date" in first else 0
+        deep = any(len(r) > di and r[di] and (len(r) <= mi or not r[mi]) for r in sheet.get_all_values()[1:])
+    limit = DEEP_FETCH if deep else 50
+    activities = []
+    try:
+        while len(activities) < limit:
+            page = garmin.get_activities(len(activities), min(100, limit - len(activities))) or []
+            activities += page
+            if len(page) < min(100, limit - len(activities) + len(page)):
+                break                                   # reached the oldest activity
+        print(f"Found {len(activities)} total activities" + (" (looking further back to fill Moving Time)" if deep else ""))
     except Exception as e:
         print(f"❌ Failed to fetch activities: {e}")
-        return
+        if not activities:
+            return
 
     running = [
         a for a in activities
@@ -282,11 +326,6 @@ def sync_runs(garmin, spreadsheet):
     print(f"Found {len(running)} running activities")
     if not running:
         return
-
-    try:
-        sheet = spreadsheet.worksheet(RUN_SHEET)
-    except gspread.WorksheetNotFound:
-        sheet = spreadsheet.sheet1
 
     header = ensure_headers(sheet, BASE_RUN_HEADERS[:12] + NEW_RUN_HEADERS + DETAIL_RUN_HEADERS,
                             base=BASE_RUN_HEADERS + NEW_RUN_HEADERS + DETAIL_RUN_HEADERS)
@@ -324,6 +363,10 @@ def sync_runs(garmin, spreadsheet):
         for name in NEW_RUN_HEADERS + DETAIL_RUN_HEADERS:
             if not cell(r, name) and values.get(name, "") != "":
                 updates.append({"range": rowcol_to_a1(row_number, col[name] + 1), "values": [[values[name]]]})
+        # Re-state the average pace on moving time (rows written before this change used the timer time).
+        old_pace, new_pace = to_number(cell(r, "Avg Pace (min/km)")), values["Avg Pace (min/km)"]
+        if new_pace and old_pace is not None and abs(old_pace - new_pace) >= 0.005:
+            updates.append({"range": rowcol_to_a1(row_number, col["Avg Pace (min/km)"] + 1), "values": [[new_pace]]})
         existing_ids.add(values["Activity ID"])
         matched_rows.add(row_number)
     if updates:
