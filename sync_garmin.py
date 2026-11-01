@@ -18,7 +18,15 @@ What it writes
                      training status, load and load focus, lactate threshold HR
                      and pace, and Garmin's race predictions.
 
+  3. Per-run details from Garmin's official Personal API (optional): your RPE and feel rating, exact
+                     heart-rate drift, power drift, grade-adjusted pace, heart rate after the warm-up and
+                     Garmin's performance condition at the start and end. Calculated from the run's samples;
+                     only these summary numbers are stored. Every run in the sheet that has an Activity ID
+                     is filled in once (the "API Data" column marks it done).
+
 Optional environment variables
+  GARMIN_PERSONAL_API_KEY  your Personal API key from Garmin Connect (part 3 is skipped without it)
+  API_BACKFILL    at most this many runs get API details per sync (default 150)
   DAILY_DAYS      how many past days to refresh each run (default 3; recent days
                   are refreshed because sleep/HRV arrive after the night ends)
   DAILY_BACKFILL  how many days to fill the first time the tab is empty (default 30)
@@ -33,6 +41,7 @@ from garminconnect import Garmin
 from google.oauth2.service_account import Credentials
 import gspread
 from gspread.utils import rowcol_to_a1
+import requests
 
 # Load environment variables from .env file if it exists (for local testing)
 if os.path.exists('.env'):
@@ -70,6 +79,12 @@ DETAIL_RUN_HEADERS = [
 ]
 MAX_DETAIL_BACKFILL = 60
 DEEP_FETCH = 400           # how far back to look while older runs still lack Moving Time   # at most this many existing runs get zones/weather per sync
+
+# Filled from the official Personal API (part 3). "API Data" = ok / none / error, so each run is fetched once.
+API_RUN_HEADERS = [
+    "RPE", "Feel", "Drift (%)", "Power Drift (%)", "GAP (min/km)", "Settled HR",
+    "Perf Cond Start", "Perf Cond End", "API Data",
+]
 
 DAILY_HEADERS = [
     "Date",
@@ -407,6 +422,191 @@ def sync_runs(garmin, spreadsheet):
 
 
 # --------------------------------------------------------------------------
+# Per-run details from the official Garmin Personal API
+# --------------------------------------------------------------------------
+
+PERSONAL_BASE = "https://personal.connectapi.garmin.com"
+FEEL_WORDS = {0: "Very weak", 25: "Weak", 50: "Normal", 75: "Strong", 100: "Very strong"}
+DRIFT_SKIP_S = 600          # leave out the first 10 minutes while heart rate settles
+DRIFT_MIN_S = 20 * 60       # at least 20 moving minutes must remain for a drift figure
+
+
+class PersonalApi:
+    """Read-only client for Garmin's Personal API: the key is exchanged for a 24-hour access token."""
+
+    def __init__(self, key):
+        self.key = key.strip()
+        self.token = None
+        self.http = requests.Session()
+
+    def _get_token(self):
+        r = self.http.post(PERSONAL_BASE + "/personalapitoken-service/personal-api/personal-api-key/token",
+                           headers={"Authorization": f"ApiKey {self.key}"}, timeout=30)
+        r.raise_for_status()
+        try:
+            body = r.json()
+        except ValueError:
+            body = r.text.strip()
+        if isinstance(body, dict):
+            tok = (body.get("access_token") or body.get("accessToken") or body.get("token")
+                   or dig(body, "data", "access_token") or dig(body, "data", "accessToken"))
+        else:
+            tok = body
+        if not tok:
+            raise RuntimeError(f"no access token in the token response (keys: {list(body)[:8] if isinstance(body, dict) else 'text'})")
+        self.token = tok
+
+    def get(self, path, params=None):
+        """GET a Personal API path. Returns parsed JSON, or None when Garmin has no data (404)."""
+        for attempt in range(4):
+            if not self.token:
+                self._get_token()
+            r = self.http.get(PERSONAL_BASE + path, params=params, timeout=60,
+                              headers={"Authorization": f"Bearer {self.token}", "Accept": "application/json"})
+            if r.status_code == 401 and attempt == 0:
+                self.token = None                       # expired token: fetch a new one once
+                continue
+            if r.status_code == 404:
+                return None
+            if r.status_code == 429 or r.status_code >= 500:
+                time.sleep(5 * (attempt + 1))           # throttled or a hiccup: back off and retry
+                continue
+            r.raise_for_status()
+            return r.json()
+        raise RuntimeError(f"Garmin kept refusing {path}")
+
+
+def detail_rows(details):
+    """Turn the /details response into a list of {metric: value} samples."""
+    if not isinstance(details, dict):
+        return []
+    keys = {m.get("metricsIndex"): m.get("key") for m in details.get("metricDescriptors", []) or []}
+    rows = []
+    for m in details.get("activityDetailMetrics", []) or []:
+        vals = m.get("metrics") or []
+        rows.append({keys[i]: v for i, v in enumerate(vals) if i in keys and v is not None})
+    return [r for r in rows if r.get("sumDuration") is not None]
+
+
+def drift_pct(samples, value_key):
+    """Decoupling: how much 'value per heartbeat' drops from the first to the second half of the run
+    (after the warm-up), halves split by moving time. value_key: 'speed' (pace:HR) or a sample key like directPower."""
+    s = [r for r in samples if r.get("sumDuration", 0) >= DRIFT_SKIP_S and r.get("directHeartRate")
+         and r.get("sumMovingDuration") is not None and r.get("sumDistance") is not None]
+    if len(s) < 8:
+        return ""
+    t0, t1 = s[0]["sumMovingDuration"], s[-1]["sumMovingDuration"]
+    if t1 - t0 < DRIFT_MIN_S:
+        return ""
+    mid = (t0 + t1) / 2
+    halves = [[r for r in s if r["sumMovingDuration"] <= mid], [r for r in s if r["sumMovingDuration"] >= mid]]
+    eff = []
+    for h in halves:
+        if len(h) < 3:
+            return ""
+        hr = sum(r["directHeartRate"] for r in h) / len(h)
+        if value_key == "speed":
+            dt = h[-1]["sumMovingDuration"] - h[0]["sumMovingDuration"]
+            dd = h[-1]["sumDistance"] - h[0]["sumDistance"]
+            if dt <= 0 or dd <= 0:
+                return ""
+            v = dd / dt
+        else:
+            vals = [r[value_key] for r in h if r.get(value_key)]
+            if len(vals) < len(h) / 2:
+                return ""
+            v = sum(vals) / len(vals)
+        eff.append(v / hr)
+    return round((eff[0] - eff[1]) / eff[0] * 100, 1)
+
+
+def api_values(api, activity_id):
+    """The API_RUN_HEADERS values for one run (status in 'API Data')."""
+    out = {name: "" for name in API_RUN_HEADERS}
+    act = api.get(f"/activity-service/activity/{activity_id}")
+    if not act:
+        out["API Data"] = "none"
+        return out
+    summ = act.get("summaryDTO") or {}
+    rpe, feel, gas = summ.get("directWorkoutRpe"), summ.get("directWorkoutFeel"), summ.get("avgGradeAdjustedSpeed")
+    if rpe is not None:
+        out["RPE"] = round(rpe / 10)                     # Garmin stores 10-100 for RPE 1-10
+    if feel is not None:
+        out["Feel"] = FEEL_WORDS.get(int(round(feel / 25) * 25), "")
+    if gas:
+        out["GAP (min/km)"] = round(1000 / gas / 60, 2)
+    samples = detail_rows(api.get(f"/activity-service/activity/{activity_id}/details"))
+    if samples:
+        out["Drift (%)"] = drift_pct(samples, "speed")
+        out["Power Drift (%)"] = drift_pct(samples, "directPower")
+        settled = [r["directHeartRate"] for r in samples if r.get("sumDuration", 0) >= DRIFT_SKIP_S and r.get("directHeartRate")]
+        if settled:
+            out["Settled HR"] = round(sum(settled) / len(settled))
+        # Garmin starts reporting performance condition after about 6 minutes of running
+        pcs = [r["directPerformanceCondition"] for r in samples
+               if r.get("directPerformanceCondition") is not None and r.get("sumDuration", 0) >= 360]
+        if pcs:
+            out["Perf Cond Start"] = round(sum(pcs[:3]) / len(pcs[:3]))
+            out["Perf Cond End"] = round(sum(pcs[-3:]) / len(pcs[-3:]))
+    out["API Data"] = "ok"
+    return out
+
+
+def sync_api_details(spreadsheet):
+    """Fill the API columns for every run in the sheet that has an Activity ID and isn't done yet."""
+    key = os.environ.get("GARMIN_PERSONAL_API_KEY", "").strip()
+    if not key:
+        print("\nPersonal API: no GARMIN_PERSONAL_API_KEY set, skipping run details")
+        return
+    print("\nFetching run details from the Garmin Personal API...")
+    try:
+        sheet = spreadsheet.worksheet(RUN_SHEET)
+    except gspread.WorksheetNotFound:
+        sheet = spreadsheet.sheet1
+    header = ensure_headers(sheet, API_RUN_HEADERS)
+    col = {name: i for i, name in enumerate(header)}
+    rows = sheet.get_all_values()[1:]
+    cell = lambda r, name: r[col[name]] if col.get(name) is not None and col[name] < len(r) else ""
+    todo = [(n, cell(r, "Activity ID")) for n, r in enumerate(rows, start=2)
+            if cell(r, "Activity ID") and not cell(r, "API Data")]
+    no_id = sum(1 for r in rows if cell(r, "Date") and not cell(r, "Activity ID"))
+    if no_id:
+        print(f"  {no_id} run(s) have no Activity ID and are skipped")
+    budget = int(os.environ.get("API_BACKFILL", "150"))
+    todo = todo[-budget:]                                # newest first if there are more than the budget
+    api, updates, done = PersonalApi(key), [], 0
+    for row_number, activity_id in todo:
+        try:
+            values = api_values(api, activity_id)
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else "?"
+            if code in (401, 403):
+                print(f"  ❌ Personal API refused the key ({code}). Check that it hasn't expired or been deleted.")
+                break
+            print(f"  ⚠️ {activity_id}: HTTP {code}")
+            values = {name: "" for name in API_RUN_HEADERS}
+            values["API Data"] = "error"
+        except Exception as e:  # noqa: BLE001 - one bad run never blocks the rest
+            print(f"  ⚠️ {activity_id}: {e}")
+            values = {name: "" for name in API_RUN_HEADERS}
+            values["API Data"] = "error"
+        line = [values.get(name, "") for name in API_RUN_HEADERS]
+        first = col[API_RUN_HEADERS[0]] + 1
+        if all(col[API_RUN_HEADERS[k]] == col[API_RUN_HEADERS[0]] + k for k in range(len(API_RUN_HEADERS))):
+            updates.append({"range": rowcol_to_a1(row_number, first), "values": [line]})
+        else:
+            updates += [{"range": rowcol_to_a1(row_number, col[name] + 1), "values": [[values[name]]]} for name in API_RUN_HEADERS]
+        done += 1
+        if len(updates) >= 40:                          # write in batches so a long backfill keeps its progress
+            sheet.batch_update(updates, value_input_option="RAW")
+            updates = []
+        time.sleep(0.4)                                 # be gentle with Garmin
+    if updates:
+        sheet.batch_update(updates, value_input_option="RAW")
+    print(f"✅ Personal API: details for {done} run(s)" + (f", {len(todo) - done} left for the next sync" if done < len(todo) else ""))
+
+
+# --------------------------------------------------------------------------
 # Daily metrics
 # --------------------------------------------------------------------------
 
@@ -619,6 +819,10 @@ def main():
         sync_runs(garmin, spreadsheet)
     except Exception as e:
         print(f"❌ Run sync failed: {e}")
+    try:
+        sync_api_details(spreadsheet)
+    except Exception as e:
+        print(f"❌ Personal API details failed: {e}")
     try:
         sync_daily(garmin, spreadsheet)
     except Exception as e:
