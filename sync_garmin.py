@@ -83,8 +83,11 @@ DEEP_FETCH = 400           # how far back to look while older runs still lack Mo
 # Filled from the official Personal API (part 3). "API Data" = ok / none / error, so each run is fetched once.
 API_RUN_HEADERS = [
     "RPE", "Feel", "Drift (%)", "Power Drift (%)", "GAP (min/km)", "Settled HR",
-    "Perf Cond Start", "Perf Cond End", "API Data",
+    "Perf Cond Start", "Perf Cond End",
+    "Best 1K (s)", "Best 5K (s)", "Best 10K (s)", "BB Cost", "Stopped (s)", "Minute Data",
+    "API Data",
 ]
+API_VERSION = "v2"      # rows marked with an older version are fetched again so new columns get filled
 
 DAILY_HEADERS = [
     "Date",
@@ -520,9 +523,55 @@ def drift_pct(samples, value_key):
     return round((eff[0] - eff[1]) / eff[0] * 100, 1)
 
 
-def api_values(api, activity_id):
+def minute_data(samples):
+    """The run per minute, compact JSON for the planner: cumulative moving seconds (m) and metres (d), and the minute's
+    average heart rate (hr), power (p), cadence (c), ground contact (g), vertical ratio (vr) and performance condition (pc)."""
+    if not samples:
+        return ""
+    keys = {"hr": "directHeartRate", "p": "directPower", "c": "directDoubleCadence", "g": "directGroundContactTime",
+            "vr": "directVerticalRatio", "pc": "directPerformanceCondition"}
+    out = {"v": 1, "m": [], "d": []}
+    out.update({k: [] for k in keys})
+    end = samples[-1]["sumDuration"]
+    for t in range(60, int(end) + 60, 60):
+        b = [r for r in samples if t - 60 <= r["sumDuration"] < t] or [r for r in samples if r["sumDuration"] <= t][-1:]
+        if not b:
+            continue
+        last = b[-1]
+        out["m"].append(round(last.get("sumMovingDuration") or last["sumDuration"]))
+        out["d"].append(round(last.get("sumDistance") or 0))
+        for k, key in keys.items():
+            vals = [r[key] for r in b if r.get(key) is not None and (key != "directPower" or r[key] > 0)]
+            v = sum(vals) / len(vals) if vals else None
+            out[k].append(None if v is None else (round(v, 1) if k == "vr" else round(v)))
+    return json.dumps(out, separators=(",", ":"))
+
+
+def search_index(api, start_date):
+    """Activity-list entries (fastest splits, Body Battery cost, stopped time) for all runs since start_date, by id."""
+    out, start = {}, 0
+    while True:
+        page = api.get("/activitylist-service/activities/search/activities",
+                       {"start": str(start), "limit": "100", "startDate": start_date, "endDate": date.today().isoformat()}) or []
+        for a in page:
+            if a.get("activityId"):
+                out[str(a["activityId"])] = a
+        if len(page) < 100:
+            return out
+        start += 100
+
+
+def api_values(api, activity_id, listing=None):
     """The API_RUN_HEADERS values for one run (status in 'API Data')."""
     out = {name: "" for name in API_RUN_HEADERS}
+    if listing:
+        for col, key in (("Best 1K (s)", "fastestSplit_1000"), ("Best 5K (s)", "fastestSplit_5000"), ("Best 10K (s)", "fastestSplit_10000")):
+            if listing.get(key):
+                out[col] = round(listing[key])
+        if listing.get("differenceBodyBattery") is not None:
+            out["BB Cost"] = listing["differenceBodyBattery"]
+        stopped = sum(s.get("duration") or 0 for s in (listing.get("splitSummaries") or []) if s.get("splitType") in ("RWD_STAND", "RWD_WALK"))
+        out["Stopped (s)"] = round(stopped)
     act = api.get(f"/activity-service/activity/{activity_id}")
     if not act:
         out["API Data"] = "none"
@@ -548,7 +597,8 @@ def api_values(api, activity_id):
         if pcs:
             out["Perf Cond Start"] = round(sum(pcs[:3]) / len(pcs[:3]))
             out["Perf Cond End"] = round(sum(pcs[-3:]) / len(pcs[-3:]))
-    out["API Data"] = "ok"
+        out["Minute Data"] = minute_data(samples)
+    out["API Data"] = API_VERSION
     return out
 
 
@@ -567,17 +617,25 @@ def sync_api_details(spreadsheet):
     col = {name: i for i, name in enumerate(header)}
     rows = sheet.get_all_values()[1:]
     cell = lambda r, name: r[col[name]] if col.get(name) is not None and col[name] < len(r) else ""
+    # new runs, and runs fetched by an older version of this script (so the newer columns get filled too)
     todo = [(n, cell(r, "Activity ID")) for n, r in enumerate(rows, start=2)
-            if cell(r, "Activity ID") and not cell(r, "API Data")]
+            if cell(r, "Activity ID") and cell(r, "API Data") not in (API_VERSION, "none")]
     no_id = sum(1 for r in rows if cell(r, "Date") and not cell(r, "Activity ID"))
     if no_id:
         print(f"  {no_id} run(s) have no Activity ID and are skipped")
     budget = int(os.environ.get("API_BACKFILL", "150"))
     todo = todo[-budget:]                                # newest first if there are more than the budget
     api, updates, done = PersonalApi(key), [], 0
+    listing = {}
+    if todo:
+        dates = sorted(cell(rows[n - 2], "Date") for n, _ in todo if cell(rows[n - 2], "Date"))
+        try:
+            listing = search_index(api, dates[0] if dates else (date.today() - timedelta(days=60)).isoformat())
+        except Exception as e:  # noqa: BLE001 - the per-run part still works without it
+            print(f"  ⚠️ activity list: {e}")
     for row_number, activity_id in todo:
         try:
-            values = api_values(api, activity_id)
+            values = api_values(api, activity_id, listing.get(str(activity_id)))
         except requests.HTTPError as e:
             code = e.response.status_code if e.response is not None else "?"
             if code in (401, 403):
